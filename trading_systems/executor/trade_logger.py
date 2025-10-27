@@ -1,14 +1,17 @@
 import csv
 import os
 from datetime import datetime
+from typing import Optional
 
 class TradeLogger:
-    def __init__(self, log_dir="data/logs"):
+    def __init__(self, log_dir="data/logs", log_file: Optional[str] = None):
         self.log_dir = log_dir
         os.makedirs(log_dir, exist_ok=True)
 
-        self.log_file = os.path.join(
-            log_dir, f"trades_{datetime.now().date()}.csv"
+        self.log_file = (
+            log_file
+            if log_file is not None
+            else os.path.join(log_dir, f"trades_{datetime.now().date()}.csv")
         )
 
         if not os.path.exists(self.log_file):
