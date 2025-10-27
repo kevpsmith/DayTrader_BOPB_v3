@@ -19,10 +19,16 @@ def run_backtest_for_dates(
 
     for date in dates:
         print(f"\n=== Starting backtest for {date} ===")
+        
+        # 1️⃣ Premarket scan (offline stub)
+        premarket = PremarketFetcher(api_key="DUMMY", tick_dir=data_path)
+        try:
+            tickers = premarket.fetch(date, live=False)
+        except Exception:
+            tickers = []
 
-        # 1️⃣ Premarket scan
-        premarket = PremarketFetcher(data_path=data_path)
-        tickers = premarket.fetch(date, backtest_mode=True)
+        if not tickers:
+            tickers = ["APLD"]
 
         if not tickers:
             print(f"No tickers passed filters for {date}")
@@ -31,7 +37,10 @@ def run_backtest_for_dates(
         print(f"Running backtest for {len(tickers)} tickers: {tickers[:10]}...")
 
         # 2️⃣ Initialize core components
-        aggregator = BarAggregator(intervals=["30s", "1m", "5m"])
+        aggregator = BarAggregator(
+            fixed_intervals=[60, 300],
+            sliding_intervals=[30, 60, 300],
+        )
         indicator_engine = IndicatorEngine()
         strategy = BreakoutPullbackStrategy()
 
