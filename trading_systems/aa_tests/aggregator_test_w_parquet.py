@@ -3,8 +3,12 @@ import sys, os
 # add the project root to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import pandas as pd
+from datetime import timedelta
+from typing import Dict, List
+
 import pytz
 import pytest
+
 from data_io.bar_aggregator import BarAggregator
 
 TICKER    = "APLD"
@@ -26,6 +30,7 @@ def test_aggregator_parquet(tick_df):
 
     fixed_bars = []
     sliding_bars = []
+    snapshots: Dict[int, List[Dict]] = {}
     for ts, row in tick_df.iterrows():
         tick = {
             "timestamp": ts,
@@ -36,8 +41,10 @@ def test_aggregator_parquet(tick_df):
         for b in bars:
             if b["type"] == "fixed":
                 fixed_bars.append(b)
-            else:
+            elif b["type"] == "sliding":
                 sliding_bars.append(b)
+            elif b["type"] == "sliding_snapshot":
+                snapshots.setdefault(b["interval"], []).append(b)
 
     # basic smoke assertions:
     #  - we should have exactly 390 one-minute fixed bars in a full session
@@ -45,6 +52,25 @@ def test_aggregator_parquet(tick_df):
     assert num_1m_fixed > 0, "No 1-minute bars produced"
     #  - sliding bars should be one per tick for each sliding interval
     assert len(sliding_bars) == len(tick_df) * 2
+
+    #  - each snapshot should include monotonic one-minute spacing
+    for interval, entries in snapshots.items():
+        assert len(entries) == len(tick_df)
+        for snap in entries:
+            bars = snap["bars"]
+            if len(bars) < 2:
+                continue
+            deltas = [
+                bars[i]["end_time"] - bars[i - 1]["end_time"]
+                for i in range(1, len(bars))
+            ]
+            expected = timedelta(seconds=interval)
+            for delta in deltas:
+                assert delta == expected
+            for prev, curr in zip(bars, bars[1:]):
+                assert curr["start_time"] == prev["end_time"], (
+                    "Sliding bars must be back-to-back without overlap"
+                )
 
     # (Optionally) inspect the first few bars
     print("First 3 fixed 1m bars:", fixed_bars[:3])
