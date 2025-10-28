@@ -14,13 +14,16 @@ class MockExecutor:
             side = signal["side"]
             size = signal["size"]
             price = bars.iloc[-1]["close"] if hasattr(bars, "iloc") else bars["close"]
+            timestamp = signal.get("timestamp")
+            if timestamp is None and hasattr(bars, "iloc"):
+                timestamp = bars.iloc[-1].get("timestamp_dt")            
             self._apply_trade(ticker, side, size, price)
             executed_orders.append({
                 "ticker": ticker,
                 "side": side,
                 "size": size,
                 "price": price,
-                "timestamp": datetime.now()
+                "timestamp": timestamp or datetime.now()
             })
         return executed_orders
 
