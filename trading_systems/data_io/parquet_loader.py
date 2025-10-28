@@ -1,5 +1,7 @@
 import os
 import pandas as pd
+from datetime import datetime
+from typing import Optional
 
 class ParquetLoader:
     def __init__(self, base_path: str, date: str):
@@ -31,11 +33,35 @@ class ParquetLoader:
         df = df.dropna(subset=["timestamp"])
         return df
 
-    def stream_ticks(self, tickers: list):
+    def _normalise_bound(self, bound: Optional[object]) -> Optional[pd.Timestamp]:
+        if bound is None:
+            return None
+
+        if isinstance(bound, pd.Timestamp):
+            ts = bound
+        else:
+            ts = pd.Timestamp(bound)
+
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    def stream_ticks(
+        self,
+        tickers: list,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ):
+        start_bound = self._normalise_bound(start_time)
+        end_bound = self._normalise_bound(end_time)
         for ticker in tickers:
             df = self.load_ticker_data(ticker)
             # ✅ No ambiguity now — timestamp is a normal column
             df = df.sort_values("timestamp")
+            if start_bound is not None:
+                df = df[df["timestamp"] >= start_bound]
+            if end_bound is not None:
+                df = df[df["timestamp"] <= end_bound]            
             for _, row in df.iterrows():
                 yield {
                     "ticker": ticker,
