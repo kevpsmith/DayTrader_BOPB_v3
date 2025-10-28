@@ -1,0 +1,10 @@
+pandas>=2.0.0
+numpy>=1.26.0
+torch>=2.2.0
+pytorch-lightning>=2.2.0
+matplotlib
+tqdm
+requests
+polygon-api-client
+scikit-learn
+pyyaml
