@@ -53,9 +53,12 @@ aggregator = BarAggregator(fixed_intervals=[60,300], sliding_intervals=[60,300])
 indicator_engine = IndicatorEngine(intervals=[60, 300])
 strategy = BreakoutPullbackStrategy()
 
+sample_ticker_count = min(5, len(tickers))
+assert sample_ticker_count >= 3, "Premarket filter should yield at least 3 tickers for smoke coverage"
+
 backtest = BacktestOrchestrator(
     date=DATE,
-    tickers=tickers[:2],  # just two for speed
+    tickers=tickers[:sample_ticker_count],  # exercise multiple tickers for better coverage
     aggregator=aggregator,
     indicator_engine=indicator_engine,
     strategy=strategy,
