@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from queue import Empty, Queue
 from threading import Event, Thread
 from typing import DefaultDict, Dict, Iterable, List, Optional
+from numbers import Number
 import pandas as pd
 
 def _ensure_utc(ts: datetime) -> datetime:
@@ -20,6 +21,27 @@ def _ensure_utc(ts: datetime) -> datetime:
             timezone.utc
         )
     raise TypeError(f"Unsupported timestamp type: {type(ts)!r}")
+
+
+class _ReplayAwareFormatter(logging.Formatter):
+    """Formatter that reflects replay time in log records when available."""
+
+    def __init__(self, clock, fmt=None, datefmt=None):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self._clock = clock
+
+    def formatTime(self, record, datefmt=None):  # noqa: N802 - API contract from logging
+        clock = self._clock
+        if clock and getattr(clock, "mode", None) == "replay":
+            try:
+                current = clock.now_ny()
+            except Exception:  # pragma: no cover - defensive
+                current = None
+            if current is not None:
+                if datefmt:
+                    return current.strftime(datefmt)
+                return current.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        return super().formatTime(record, datefmt)
 
 
 class OrchestratorCore:
@@ -57,6 +79,10 @@ class OrchestratorCore:
         self.enable_threading = enable_threading
         self.max_workers = max_workers
         self.default_trade_size = default_trade_size
+        self._processed_events = 0
+        self._progress_log_interval = 50_000
+        self._state_log_interval = 5_000
+        self._bar_snapshot_count = 3
 
         self.event_queue: "Queue[Dict]" = Queue(maxsize=10_000)
         self.stop_event = Event()
@@ -79,7 +105,10 @@ class OrchestratorCore:
         self.log = logging.getLogger(self.__class__.__name__)
         if not self.log.handlers:
             handler = logging.StreamHandler()
-            fmt = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
+            fmt = _ReplayAwareFormatter(
+                self.clock,
+                fmt="[%(asctime)s] %(levelname)s: %(message)s",
+            )
             handler.setFormatter(fmt)
             self.log.addHandler(handler)
             self.log.setLevel(logging.INFO)
@@ -142,16 +171,17 @@ class OrchestratorCore:
     def _safe_process_event(self, event: Dict) -> None:
         try:
             self._process_event(event)
-        except Exception:
-            self.log.error("Event processing error:")
-            self.log.debug(traceback.format_exc())
+        except Exception as exc:
+            self.log.error("Event processing error: %s", exc, exc_info=True)
 
     def _process_event(self, event: Dict) -> None:
         ticker = event.get("ticker")
         ts = event.get("timestamp")
         price = event.get("price")
         size = event.get("size", 1)
+        self._processed_events += 1
         if not (ticker and ts and price is not None):
+            self._maybe_log_progress(ticker, ts)
             return
 
         ts_utc = _ensure_utc(ts)
@@ -168,6 +198,7 @@ class OrchestratorCore:
 
         bars = self.aggregator.add_tick(tick)
         if not bars:
+            self._maybe_log_progress(ticker, ts_utc)
             return
 
         signals_by_ticker: Dict[str, List[Dict]] = {}
@@ -182,6 +213,8 @@ class OrchestratorCore:
 
         if signals_by_ticker:
             self._dispatch_signals(signals_by_ticker)
+
+        self._maybe_log_progress(ticker, ts_utc)
 
     # ------------------------------------------------------------------
     # Bar ingestion & storage
@@ -263,9 +296,9 @@ class OrchestratorCore:
 
         df_trend = None
         if self.trend_interval is not None:
-            df_trend = sliding.get(self.trend_interval) or self.bar_history[ticker][
-                "fixed"
-            ].get(self.trend_interval)
+            df_trend = sliding.get(self.trend_interval)
+            if df_trend is None:
+                df_trend = self.bar_history[ticker]["fixed"].get(self.trend_interval)
             if df_trend is None or len(df_trend) < 2:
                 return []
 
@@ -286,6 +319,21 @@ class OrchestratorCore:
                 position["entry_time"],
                 last_row["timestamp_dt"],
             ):
+                summary = self._format_indicator_summary(last_row)
+                ts_display = last_row["timestamp_dt"].strftime("%Y-%m-%d %H:%M:%S")
+                if summary:
+                    self.log.info(
+                        "Exit signal for %s @ %s | %s",
+                        ticker,
+                        ts_display,
+                        summary,
+                    )
+                else:
+                    self.log.info(
+                        "Exit signal for %s @ %s",
+                        ticker,
+                        ts_display,
+                    )
                 signals.append(
                     {
                         "ticker": ticker,
@@ -301,6 +349,21 @@ class OrchestratorCore:
                     df_fast,
                     len(df_primary) - 1,
                 ):
+                    summary = self._format_indicator_summary(last_row)
+                    ts_display = last_row["timestamp_dt"].strftime("%Y-%m-%d %H:%M:%S")
+                    if summary:
+                        self.log.info(
+                            "Entry signal for %s @ %s | %s",
+                            ticker,
+                            ts_display,
+                            summary,
+                        )
+                    else:
+                        self.log.info(
+                            "Entry signal for %s @ %s",
+                            ticker,
+                            ts_display,
+                        )
                     signals.append(
                         {
                             "ticker": ticker,
@@ -411,3 +474,126 @@ class OrchestratorCore:
                 self.trade_logger.close()
             except Exception:  # pragma: no cover - defensive
                 pass
+
+    # ------------------------------------------------------------------
+    # Progress helpers
+    # ------------------------------------------------------------------
+    def _maybe_log_progress(self, ticker: Optional[str], ts) -> None:
+        interval = getattr(self, "_progress_log_interval", 0)
+        if not interval or self._processed_events % interval:
+            return
+
+        display = "n/a"
+        if ts is not None:
+            try:
+                ts_utc = _ensure_utc(ts)
+                display = ts_utc.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                display = str(ts)
+
+        self.log.info(
+            "Processed %d events (last %s @ %s)",
+            self._processed_events,
+            ticker or "n/a",
+            display,
+        )
+
+    # ------------------------------------------------------------------
+    # State logging helpers
+    # ------------------------------------------------------------------
+    def _log_recent_state(self) -> None:
+        interval = getattr(self, "_state_log_interval", 0)
+        if not interval or self._processed_events % interval:
+            return
+
+        for ticker in self.tickers:
+            history = self.bar_history.get(ticker)
+            if not history:
+                continue
+
+            sliding = history.get("sliding", {})
+            df_primary = sliding.get(self.primary_interval)
+            if df_primary is None or df_primary.empty:
+                continue
+
+            tail = df_primary.tail(self._bar_snapshot_count)
+            bar_lines = []
+            for _, row in tail.iterrows():
+                end_time = row.get("end_time")
+                try:
+                    ts_display = end_time.strftime("%H:%M:%S") if end_time else "?"
+                except Exception:
+                    ts_display = str(end_time)
+
+                def _fmt(value: Number) -> str:
+                    return f"{value:.2f}" if isinstance(value, Number) else str(value)
+
+                volume_value = row.get("volume", 0)
+                if volume_value is None or pd.isna(volume_value):
+                    volume_display = "0"
+                else:
+                    try:
+                        volume_display = f"{int(volume_value)}"
+                    except (TypeError, ValueError):
+                        volume_display = str(volume_value)
+
+                bar_lines.append(
+                    "@{time} O:{open} H:{high} L:{low} C:{close} V:{volume}".format(
+                        time=ts_display,
+                        open=_fmt(row.get("open")),
+                        high=_fmt(row.get("high")),
+                        low=_fmt(row.get("low")),
+                        close=_fmt(row.get("close")),
+                        volume=volume_display,
+                    )
+                )
+
+            if bar_lines:
+                self.log.info(
+                    "Bars[%s][%ss]: %s",
+                    ticker,
+                    self.primary_interval,
+                    " | ".join(bar_lines),
+                )
+
+            last_row = tail.iloc[-1]
+            indicator_summary = self._format_indicator_summary(last_row)
+            position_state = "open" if ticker in self.positions else "flat"
+            if indicator_summary:
+                self.log.info(
+                    "Indicators[%s] (%s): %s",
+                    ticker,
+                    position_state,
+                    indicator_summary,
+                )
+            else:
+                self.log.info(
+                    "Indicators[%s] (%s): awaiting data",
+                    ticker,
+                    position_state,
+                )
+
+    def _format_indicator_summary(self, row: pd.Series) -> str:
+        summary_parts: List[str] = []
+        indicator_fields = (
+            "close",
+            "rsi",
+            "macd",
+            "macd_signal",
+            "macd_hist",
+            "vwap",
+            "atr",
+            "roll_high",
+            "roll_low",
+        )
+        for field in indicator_fields:
+            if field not in row:
+                continue
+            value = row.get(field)
+            if value is None or pd.isna(value):
+                continue
+            if isinstance(value, Number):
+                summary_parts.append(f"{field}={value:.2f}")
+            else:
+                summary_parts.append(f"{field}={value}")
+        return ", ".join(summary_parts)
