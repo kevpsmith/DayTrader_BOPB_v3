@@ -20,7 +20,7 @@ class BarAggregator:
         sliding_intervals: Optional[List[int]] = None,
         *,
         intervals: Optional[List[int]] = None,
-        sliding_window_bars: int = 15,
+        sliding_window_bars: int = 16,
     ) -> None:
         if intervals is not None:
             fixed_intervals = list(intervals)
@@ -45,9 +45,7 @@ class BarAggregator:
         if key not in self._fixed_bars:
             self._fixed_bars[key] = {}
         if key not in self._sliding_windows:
-            self._sliding_windows[key] = {
-                iv: deque() for iv in self.sliding_intervals
-            }
+            self._sliding_windows[key] = {iv: deque() for iv in self.sliding_intervals}
 
     def _floor_time(self, ts: datetime, interval: int) -> datetime:
         epoch = int(ts.timestamp())
@@ -102,28 +100,33 @@ class BarAggregator:
             while window and window[0][0] < retention:
                 window.popleft()
 
-            ticks = list(window)
-            if not ticks:
+            if not window:
                 continue
 
+            ticks = list(window)
             interval_delta = timedelta(seconds=iv)
             bars_for_interval: List[Dict[str, Any]] = []
             end_time = ts
+            end_idx = len(ticks)
 
             for seq in range(self.sliding_window_bars):
                 start_time = end_time - interval_delta
-                segment = [
-                    entry for entry in ticks if start_time < entry[0] <= end_time
-                ]
-                if not segment:
+
+                start_idx = end_idx
+                while start_idx > 0 and ticks[start_idx - 1][0] > start_time:
+                    start_idx -= 1
+
+                if start_idx == end_idx:
                     if seq == 0:
                         bars_for_interval = []
                     break
 
+                segment = ticks[start_idx:end_idx]
+
                 open_price = segment[0][1]
+                close_price = segment[-1][1]
                 high_price = max(val[1] for val in segment)
                 low_price = min(val[1] for val in segment)
-                close_price = segment[-1][1]
                 volume = sum(val[2] for val in segment)
 
                 bars_for_interval.append(
@@ -138,8 +141,11 @@ class BarAggregator:
                         "volume": volume,
                     }
                 )
-
+                end_idx = start_idx
                 end_time = start_time
+
+                if end_idx == 0:
+                    break
 
             if not bars_for_interval:
                 continue
