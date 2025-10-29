@@ -72,6 +72,16 @@ class OrchestratorCore:
         self.aggregator = aggregator
         self.indicator_engine = indicator_engine
         self.strategy = strategy
+        
+        min_primary_bars = max(2, int(getattr(strategy, "min_primary_bars", 2)))
+        min_trend_bars = max(0, int(getattr(strategy, "min_trend_bars", 0)))
+        if hasattr(self.aggregator, "sliding_window_bars"):
+            desired_window = max(
+                int(getattr(self.aggregator, "sliding_window_bars", 1)),
+                min_primary_bars + 1,
+                min_trend_bars,
+            )
+            self.aggregator.sliding_window_bars = desired_window
         self.executor = executor
         self.clock = clock
         self.trade_logger = trade_logger
@@ -87,7 +97,11 @@ class OrchestratorCore:
         self.event_queue: "Queue[Dict]" = Queue(maxsize=10_000)
         self.stop_event = Event()
         self.bar_history: DefaultDict[str, Dict[str, Dict[int, pd.DataFrame]]]
-        self.bar_history = defaultdict(lambda: {"sliding": {}, "fixed": {}})
+        self.bar_history = defaultdict(
+            lambda: {"sliding": {}, "fixed": {}, "sliding_snapshots": {}}
+        )
+        self._latest_sliding_snapshots: DefaultDict[str, Dict[int, Dict]]
+        self._latest_sliding_snapshots = defaultdict(dict)
         self.positions: Dict[str, Dict] = {}
 
         intervals = sorted(getattr(indicator_engine, "intervals", []) or [60])
@@ -224,29 +238,18 @@ class OrchestratorCore:
         interval = bar["interval"]
         bar_type = bar.get("type", "sliding")
 
-        indicators = None
-        indicator_intervals = getattr(self.indicator_engine, "intervals", [])
-        if bar_type == "sliding" and (
-            not indicator_intervals or interval in indicator_intervals
-        ):
-            indicators = self.indicator_engine.on_sliding_bar(
-                {
-                    "interval": interval,
-                    "start_time": bar["start_time"],
-                    "end_time": bar["end_time"],
-                    "open": bar["open"],
-                    "high": bar["high"],
-                    "low": bar["low"],
-                    "close": bar["close"],
-                    "volume": bar["volume"],
-                }
-            )
+        if bar_type == "sliding_snapshot":
+            return self._ingest_sliding_snapshot(bar)
 
-        record = self._build_record(bar, indicators)
+        if bar_type == "sliding":
+            # Sliding bars are stored via the accompanying snapshot to ensure the
+            # strategy sees a contiguous, non-overlapping history.  The snapshot
+            # handler takes care of indicator updates and signal generation.
+            return []
+
+        record = self._build_record(bar, None)
         self._append_bar_to_history(ticker, interval, record, bar_type)
 
-        if bar_type == "sliding" and interval == self.primary_interval:
-            return self._generate_signals(ticker)
         return []
 
     def _build_record(self, bar: Dict, indicators: Optional[Dict]) -> Dict:
@@ -285,21 +288,95 @@ class OrchestratorCore:
         else:
             container[interval] = pd.concat([df, row]).sort_index().tail(keep_last)
 
+    def _ingest_sliding_snapshot(self, snapshot: Dict) -> List[Dict]:
+        ticker = snapshot.get("ticker")
+        interval = snapshot.get("interval")
+        bars = snapshot.get("bars") or []
+        if ticker is None or interval is None or not bars:
+            return []
+
+        records: List[Dict] = []
+        for bar in bars:
+            ts = _ensure_utc(bar["end_time"])
+            records.append(
+                {
+                    "interval": interval,
+                    "start_time": _ensure_utc(bar["start_time"]),
+                    "end_time": ts,
+                    "timestamp_dt": ts,
+                    "open": bar["open"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                    "volume": bar["volume"],
+                }
+            )
+
+        if not records:
+            return []
+
+        indicator_intervals = getattr(self.indicator_engine, "intervals", [])
+        indicators: Optional[Dict] = None
+        latest_bar = bars[-1]
+        if not indicator_intervals or interval in indicator_intervals:
+            indicators = self.indicator_engine.on_sliding_bar(
+                {
+                    "interval": interval,
+                    "start_time": latest_bar["start_time"],
+                    "end_time": latest_bar["end_time"],
+                    "open": latest_bar["open"],
+                    "high": latest_bar["high"],
+                    "low": latest_bar["low"],
+                    "close": latest_bar["close"],
+                    "volume": latest_bar["volume"],
+                }
+            )
+
+        if indicators:
+            records[-1].update(indicators)
+            records[-1].setdefault("VWAP_D", indicators.get("vwap"))
+            records[-1].setdefault("MACDh_12_26_9", indicators.get("macd_hist"))
+
+        df = pd.DataFrame(records).sort_values("timestamp_dt")
+        df = df.set_index("timestamp_dt", drop=False)
+
+        container = self.bar_history[ticker]["sliding_snapshots"]
+        container[interval] = df
+        self._latest_sliding_snapshots[ticker][interval] = snapshot
+
+        self.bar_history[ticker]["sliding"][interval] = df
+
+        if interval == self.primary_interval:
+            return self._generate_signals(ticker)
+        return []
+
     # ------------------------------------------------------------------
     # Signal generation & execution
     # ------------------------------------------------------------------
     def _generate_signals(self, ticker: str) -> List[Dict]:
         sliding = self.bar_history[ticker]["sliding"]
         df_primary = sliding.get(self.primary_interval)
-        if df_primary is None or len(df_primary) < 2:
+        if df_primary is None:
+            return []
+
+        min_primary_bars = getattr(self.strategy, "min_primary_bars", 2)
+        required_bars = max(2, int(min_primary_bars))
+        if len(df_primary) < required_bars:
             return []
 
         df_trend = None
+        trend_required = max(0, int(getattr(self.strategy, "min_trend_bars", 0)))
         if self.trend_interval is not None:
             df_trend = sliding.get(self.trend_interval)
             if df_trend is None:
                 df_trend = self.bar_history[ticker]["fixed"].get(self.trend_interval)
-            if df_trend is None or len(df_trend) < 2:
+            if df_trend is None:
+                return []
+
+            if trend_required and len(df_trend) < trend_required:
+                return []
+
+            if not trend_required and len(df_trend) < 2:
                 return []
 
         df_fast = sliding.get(self.fast_interval) if self.fast_interval else None
@@ -312,6 +389,14 @@ class OrchestratorCore:
             self.positions[ticker]["peak_price"] = max(
                 position.get("peak_price", last_row["close"]), last_row["close"]
             )
+
+            entry_ts = position.get("entry_time")
+            if entry_ts is not None:
+                current_ts = _ensure_utc(last_row["timestamp_dt"])
+                entry_ts = _ensure_utc(entry_ts)
+                if current_ts <= entry_ts:
+                    return signals
+            
             if self.strategy.check_exit(
                 last_row,
                 self.positions[ticker]["peak_price"],
@@ -343,7 +428,13 @@ class OrchestratorCore:
                     }
                 )
         else:
-            if df_trend is None or self.strategy.check_preconditions(df_trend):
+            df_trend_window = None
+            if df_trend is not None and trend_required:
+                df_trend_window = df_trend.tail(trend_required)
+            elif df_trend is not None:
+                df_trend_window = df_trend
+
+            if df_trend is None or self.strategy.check_preconditions(df_trend_window):
                 if self.strategy.check_entry(
                     df_primary,
                     df_fast,
